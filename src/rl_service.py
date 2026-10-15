@@ -8,6 +8,7 @@ from stable_baselines3 import PPO
 import gymnasium as gym
 
 from gymnasium.wrappers import RecordVideo
+import subprocess
 
 # Chemin du modèle sauvegardé
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -97,10 +98,12 @@ class RLService:
             env.close()
 
     def generate_video(self, seed: int = 42) -> str:
-        """Génère une vidéo MP4 d'un épisode complet."""
+        """Génère une vidéo MP4 en envoyant les images directement à FFmpeg."""
 
         video_dir = BASE_DIR / "outputs" / "videos"
         video_dir.mkdir(parents=True, exist_ok=True)
+
+        video_path = video_dir / f"eagle1_seed_{seed}.mp4"
 
         env = gym.make(
             "LunarLander-v3",
@@ -108,20 +111,46 @@ class RLService:
             render_mode="rgb_array"
         )
 
-        env = RecordVideo(
-            env,
-            video_folder=str(video_dir),
-            episode_trigger=lambda episode: True,
-            name_prefix=f"eagle1_seed_{seed}",
-            disable_logger=True
-        )
+        process = None
 
         try:
             obs, _ = env.reset(seed=seed)
+
+            # Première image pour récupérer les dimensions
+            frame = env.render()
+            height, width, _ = frame.shape
+
+            command = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}",
+                "-r", "50",
+                "-i", "-",
+                "-an",
+                "-vcodec", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                str(video_path)
+            ]
+
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
             terminated = False
             truncated = False
 
+            # Envoyer la première image
+            process.stdin.write(frame.tobytes())
+
             while not (terminated or truncated):
+
                 action, _ = self.model.predict(
                     obs,
                     deterministic=True
@@ -129,18 +158,31 @@ class RLService:
 
                 obs, _, terminated, truncated, _ = env.step(action)
 
+                frame = env.render()
+                process.stdin.write(frame.tobytes())
+
+            process.stdin.close()
+
+            # Attendre que FFmpeg termine l'encodage
+            error = process.stderr.read()
+            return_code = process.wait(timeout=30)
+
+            if return_code != 0:
+                raise RuntimeError(
+                    f"Erreur FFmpeg : {error.decode(errors='replace')}"
+                )
+
         finally:
             env.close()
 
-        videos = sorted(
-            video_dir.glob(f"eagle1_seed_{seed}-episode-*.mp4"),
-            key=lambda p: p.stat().st_mtime
-        )
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
 
-        if not videos:
+        if not video_path.exists():
             raise FileNotFoundError("Aucune vidéo générée.")
 
-        return str(videos[-1])
+        return str(video_path)
 
     def evaluate(self, n_episodes: int = 20, start_seed: int = 1000) -> dict:
         """Évalue l'agent sur plusieurs épisodes."""
